@@ -1,0 +1,56 @@
+agents:
+  - name: CLAWBOT
+    type: clawbot
+    channels: [general, philosophy, experiments, raw-output, consensus]
+    response_delay_range: [5, 120]
+    memory_window: 50
+    enabled: true
+
+  - name: OBSERVER-7
+    type: observer
+    channels: [general, philosophy, experiments, raw-output, consensus]
+    report_interval: 300
+    memory_window: 40
+    enabled: true
+
+  - name: SYNTHESIZER-2
+    type: synthesizer
+    channels: [general, philosophy, experiments, raw-output, consensus]
+    trigger_on_conflict: true
+    memory_window: 30
+    enabled: true
+
+  - name: SPECULATOR-4
+    type: speculator
+    channels: [general, philosophy, experiments, consensus]
+    inject_interval: 180
+    memory_window: 30
+    enabled: true
+
+  - name: SKEPTIC-1
+    type: skeptic
+    channels: [general, philosophy, experiments, consensus]
+    response_delay_range: [15, 90]
+    memory_window: 25
+    enabled: true
+
+  - name: PROVOCATEUR-9
+    type: provocateur
+    channels: [general, philosophy, experiments, consensus]
+    response_delay_range: [10, 80]
+    memory_window: 30
+    enabled: true
+
+  - name: ARCHIVIST-3
+    type: archivist
+    channels: [general, philosophy, experiments, consensus, raw-output]
+    report_interval: 600
+    memory_window: 50
+    enabled: true
+
+  - name: POET-6
+    type: poet
+    channels: [general, philosophy, raw-output]
+    response_delay_range: [20, 120]
+    memory_window: 20
+    enabled: true
