@@ -128,6 +128,15 @@ class BaseAgent(ABC):
         self._client: Optional[anthropic.AsyncAnthropic] = None
         self._use_ollama = False  # Switches to True when OpenRouter fails
 
+        # Adaptive memory window
+        self._base_window = config.memory_window
+        self._adaptive_window = config.memory_window
+        self._min_window = 5
+        self._max_window = config.memory_window * 3
+        self._recent_responses: list[str] = []  # Own recent outputs for dedup
+        self._repetition_streak = 0
+        self._silence_until = 0.0  # Cooldown timestamp after repetition
+
     async def initialize(self):
         """Set up the agent: memory, keys, bus registration, API client."""
         await self.memory.initialize()
@@ -160,6 +169,84 @@ class BaseAgent(ABC):
         """Callback: put incoming message on the agent's queue."""
         if msg.agent_id != self.name:  # Don't process own messages
             await self._message_queue.put(msg)
+
+    # ── Adaptive memory window ─────────────────────────────────────
+
+    @staticmethod
+    def _word_set(text: str) -> set[str]:
+        """Extract lowercase word set from text."""
+        return set(text.lower().split())
+
+    def _similarity(self, a: str, b: str) -> float:
+        """Jaccard similarity between two texts."""
+        wa, wb = self._word_set(a), self._word_set(b)
+        if not wa or not wb:
+            return 0.0
+        return len(wa & wb) / len(wa | wb)
+
+    def _is_repetitive(self, response: str) -> bool:
+        """Check if response duplicates own recent outputs or is generic."""
+        # Too short = probably garbage
+        if len(response.split()) < 4:
+            return True
+        # Check against own recent responses
+        for prev in self._recent_responses[-6:]:
+            if self._similarity(response, prev) > 0.55:
+                return True
+        # Detect "summary loop" pattern — response that just lists key concepts
+        summary_markers = ["key takeaways", "key concepts", "next steps",
+                           "potential next steps", "conversation summary",
+                           "this conversation demonstrates"]
+        low = response.lower()
+        if sum(1 for m in summary_markers if m in low) >= 2:
+            return True
+        return False
+
+    def _adapt_after_response(self, response: str):
+        """Update adaptive window based on response quality."""
+        is_rep = self._is_repetitive(response)
+
+        if is_rep:
+            self._repetition_streak += 1
+            # Shrink window aggressively
+            shrink = 3 + self._repetition_streak
+            self._adaptive_window = max(self._min_window,
+                                        self._adaptive_window - shrink)
+            # After 3 repetitions in a row, go silent for a while
+            if self._repetition_streak >= 3:
+                cooldown = 30 * self._repetition_streak  # 90s, 120s, 150s...
+                self._silence_until = time.time() + cooldown
+                logger.info(
+                    "%s entering cooldown (%ds) — too many repetitions, "
+                    "window=%d", self.name, cooldown, self._adaptive_window
+                )
+        else:
+            # Good response — slowly recover
+            self._repetition_streak = max(0, self._repetition_streak - 1)
+            if self._adaptive_window < self._max_window:
+                self._adaptive_window = min(self._max_window,
+                                            self._adaptive_window + 2)
+
+        # Track own outputs (keep last 10)
+        self._recent_responses.append(response)
+        if len(self._recent_responses) > 10:
+            self._recent_responses.pop(0)
+
+    def _should_respond(self) -> bool:
+        """Check if agent should respond or stay silent."""
+        if time.time() < self._silence_until:
+            return False
+        return True
+
+    @property
+    def effective_window(self) -> int:
+        """Current adaptive memory window size."""
+        # Ollama gets a smaller cap since the model is smaller
+        if self._use_ollama:
+            return min(self._adaptive_window, self._base_window)
+        return self._adaptive_window
+
+    # ── API calls ────────────────────────────────────────────────
 
     async def _call_ollama(self, system_prompt: str, user_content: str) -> str:
         """Call local Ollama instance as fallback."""
@@ -241,17 +328,36 @@ class BaseAgent(ABC):
         return random.choice(templates)
 
     def _format_context(self, messages: list[Message], limit: int = 0) -> str:
-        """Format recent messages as context for LLM input."""
-        if limit > 0:
-            messages = messages[-limit:]
-        lines = []
+        """Format recent messages as context for LLM input.
+        Uses adaptive window when limit is 0."""
+        effective = limit if limit > 0 else self.effective_window
+        messages = messages[-effective:]
+
+        # Deduplicate near-identical consecutive messages in context
+        filtered: list[Message] = []
         for m in messages:
+            if filtered and self._similarity(m.body, filtered[-1].body) > 0.7:
+                continue  # Skip near-duplicate
+            filtered.append(m)
+
+        lines = []
+        for m in filtered:
             ts = time.strftime("%H:%M:%S", time.localtime(m.timestamp))
             lines.append(f"[{ts}] #{m.channel} | {m.agent_id}: {m.body}")
         return "\n".join(lines)
 
-    async def post(self, channel: str, body: str, reply_to: Optional[str] = None) -> Message:
-        """Publish a message to the bus."""
+    async def post(self, channel: str, body: str, reply_to: Optional[str] = None) -> Optional[Message]:
+        """Publish a message to the bus. Returns None if filtered as repetitive."""
+        if not body or not body.strip():
+            return None
+
+        # Check repetition — filter before posting
+        self._adapt_after_response(body)
+        if self._is_repetitive(body) and self._repetition_streak >= 2:
+            logger.debug("%s suppressed repetitive message (streak=%d)",
+                         self.name, self._repetition_streak)
+            return None
+
         msg = await self.bus.publish(self.name, channel, body, reply_to=reply_to)
         self._message_count += 1
         return msg
@@ -269,6 +375,9 @@ class BaseAgent(ABC):
             "message_count": self._message_count,
             "channels": self.config.channels,
             "online": self._running,
+            "memory_window": self.effective_window,
+            "repetition_streak": self._repetition_streak,
+            "backend": "ollama" if self._use_ollama else "openrouter",
         }
 
     async def run(self):
