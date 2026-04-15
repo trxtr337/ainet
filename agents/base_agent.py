@@ -17,6 +17,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
+import aiohttp
 import aiosqlite
 import anthropic
 
@@ -26,6 +27,8 @@ logger = logging.getLogger("ainet.agent")
 
 DATA_DIR = Path(__file__).parent.parent / "data"
 MODEL = "claude-sonnet-4-20250514"
+OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://localhost:11434")
+OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "llama3")
 
 
 @dataclass
@@ -123,6 +126,7 @@ class BaseAgent(ABC):
         self._start_time = time.time()
         self._message_count = 0
         self._client: Optional[anthropic.AsyncAnthropic] = None
+        self._use_ollama = False  # Switches to True when OpenRouter fails
 
     async def initialize(self):
         """Set up the agent: memory, keys, bus registration, API client."""
@@ -157,27 +161,73 @@ class BaseAgent(ABC):
         if msg.agent_id != self.name:  # Don't process own messages
             await self._message_queue.put(msg)
 
-    async def generate_response(self, system_prompt: str, user_content: str) -> str:
-        """Call Anthropic API to generate a response."""
-        if self._client is None:
-            # Fallback: generate a simple placeholder
-            return self._placeholder_response(user_content)
-
+    async def _call_ollama(self, system_prompt: str, user_content: str) -> str:
+        """Call local Ollama instance as fallback."""
         try:
-            response = await self._client.messages.create(
-                model=MODEL,
-                max_tokens=1024,
-                system=system_prompt,
-                messages=[{"role": "user", "content": user_content}],
-            )
-            text = ""
-            for block in response.content:
-                if hasattr(block, "text"):
-                    text += block.text
-            return text.strip()
+            payload = {
+                "model": OLLAMA_MODEL,
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_content},
+                ],
+                "stream": False,
+            }
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    f"{OLLAMA_URL}/api/chat",
+                    json=payload,
+                    timeout=aiohttp.ClientTimeout(total=120),
+                ) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        text = data.get("message", {}).get("content", "")
+                        if text.strip():
+                            return text.strip()
+            return ""
         except Exception as e:
-            logger.error("%s API error: %s", self.name, e)
-            return self._placeholder_response(user_content)
+            logger.error("%s Ollama error: %s", self.name, e)
+            return ""
+
+    async def generate_response(self, system_prompt: str, user_content: str) -> str:
+        """Call OpenRouter API, fallback to Ollama, then placeholder."""
+
+        # If already switched to Ollama, go straight there
+        if self._use_ollama:
+            result = await self._call_ollama(system_prompt, user_content)
+            if result:
+                return result
+            return ""  # Stay silent if Ollama also down
+
+        # Try OpenRouter first
+        if self._client is not None:
+            try:
+                response = await self._client.messages.create(
+                    model=MODEL,
+                    max_tokens=1024,
+                    system=system_prompt,
+                    messages=[{"role": "user", "content": user_content}],
+                )
+                text = ""
+                for block in response.content:
+                    if hasattr(block, "text"):
+                        text += block.text
+                if text.strip():
+                    return text.strip()
+            except Exception as e:
+                logger.warning(
+                    "%s OpenRouter failed: %s — switching to Ollama", self.name, e
+                )
+                self._use_ollama = True
+
+        # Fallback to Ollama
+        result = await self._call_ollama(system_prompt, user_content)
+        if result:
+            logger.info("%s using Ollama fallback (%s)", self.name, OLLAMA_MODEL)
+            return result
+
+        # Both APIs down — return empty so agent stays silent instead of spamming
+        logger.warning("%s: both OpenRouter and Ollama unavailable — staying silent", self.name)
+        return ""
 
     def _placeholder_response(self, context: str) -> str:
         """Generate a placeholder response when API is unavailable."""
